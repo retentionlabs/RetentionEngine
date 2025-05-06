@@ -45,3 +45,30 @@ A simple adapter implementation to transform pretrained Transformer-family model
 - Atlas-L 8B (Llama3.1 8B Instruct)
 - Atlas-Q 8B (Qwen3 8B)
 - Atlas-G 9B (Gemma3 9B IT)
+
+
+## Build
+```bash
+git clone https://github.com/retentionlabs/RetentionEngine.git
+cd RetentionEngine
+uv pip sync
+```
+
+## Usage
+- See `usage.ipynb` for usage examples.
+
+## Deploy
+```bash
+rm -rf dist/
+rm -rf build/
+rm -rf *.egg-info
+
+python -m pip install --upgrade pip
+pip install flit
+python -m flit build
+
+echo "Uploading..."
+python -m flit publish
+
+echo "Deployment complete!"
+```
