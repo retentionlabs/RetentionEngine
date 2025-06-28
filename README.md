@@ -5,6 +5,7 @@ A simple adapter implementation to transform pretrained Transformer-family model
 ### Exp 1: Comparison with Base Models [3B]
 #### Baseline
 - Titans 4B (Gemma3 4B IT)
+- Atlas 4B (Gemma3 4B IT)
 - Llama3.2 3B Instruct
 - Qwen3 4B
 - Gemma3 4B IT
@@ -13,13 +14,14 @@ A simple adapter implementation to transform pretrained Transformer-family model
 - RAG + Gemma3 4B IT
 
 #### Suggested
-- Atlas-L 3B (Llama3.2 3B Instruct)
-- Atlas-Q 4B (Qwen3 4B)
-- Atlas-G 4B (Gemma3 4B IT)
+- Cronos-L 3B (Llama3.2 3B Instruct)
+- Cronos-Q 4B (Qwen3 4B)
+- Cronos-G 4B (Gemma3 4B IT)
 
 ### Exp 2: Comparison with Base Models [8B]
 #### Baseline
 - Titans 9B (Gemma2 9B IT)
+- Atlas 9B (Gemma2 9B IT)
 - Llama3.1 8B Instruct
 - Qwen3 8B
 - Gemma3 9B IT
@@ -28,23 +30,24 @@ A simple adapter implementation to transform pretrained Transformer-family model
 - RAG + Gemma3 9B IT
 
 #### Suggested
-- Atlas-L 8B (Llama3.1 8B Instruct)
-- Atlas-Q 8B (Qwen3 8B)
-- Atlas-G 9B (Gemma3 9B IT)
+- Cronos-L 8B (Llama3.1 8B Instruct)
+- Cronos-Q 8B (Qwen3 8B)
+- Cronos-G 9B (Gemma3 9B IT)
 
 ### Exp 3: Comparison with Recurrent Models [8B]
 #### Baseline
 - Titans 9B (Gemma2 9B IT)
+- Atlas 9B (Gemma2 9B IT)
 - Mamba2 8B
 - RWKV6 7B
 
 #### Suggested
-- Atlas-L 3B (Llama3.2 3B Instruct)
-- Atlas-Q 4B (Qwen3 4B)
-- Atlas-G 4B (Gemma3 4B IT)
-- Atlas-L 8B (Llama3.1 8B Instruct)
-- Atlas-Q 8B (Qwen3 8B)
-- Atlas-G 9B (Gemma3 9B IT)
+- Cronos-L 3B (Llama3.2 3B Instruct)
+- Cronos-Q 4B (Qwen3 4B)
+- Cronos-G 4B (Gemma3 4B IT)
+- Cronos-L 8B (Llama3.1 8B Instruct)
+- Cronos-Q 8B (Qwen3 8B)
+- Cronos-G 9B (Gemma3 9B IT)
 
 
 ## Build
