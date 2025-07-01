@@ -1,6 +1,10 @@
 from thelethe.titans import PretrainedTitansConfig, PreTrainedTitansModel
-from transformers import PreTrainedModel
+from transformers import PreTrainedModel, AutoTokenizer
+from torch.optim import AdamW
 from torch import nn
+
+from ..utils import Trainer
+from ..data import get_oasst_dataloader
 
 
 class RetentionEngine(nn.Module):
@@ -23,8 +27,42 @@ class RetentionEngine(nn.Module):
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)
 
-    def adapt(self, *args, **kwargs):
-        pass
+    def adapt(
+        self,
+        tokenizer: AutoTokenizer,
+        epochs: int = 1,
+        batch_size: int = 4,
+        learning_rate: float = 1e-5,
+        train_lang: str = None,
+        eval_lang: str = None,
+        device: str = "cuda"
+    ):
+
+        train_dataloader = get_oasst_dataloader(tokenizer, batch_size, split='train', lang=train_lang)
+        eval_dataloader = None
+        if eval_lang:
+            eval_dataloader = get_oasst_dataloader(tokenizer, batch_size, split='validation', lang=eval_lang)
+
+        optimizer = AdamW(self.parameters(), lr=learning_rate)
+        loss_fn = nn.CrossEntropyLoss()
+
+        trainer = Trainer(
+            model=self,
+            optimizer=optimizer,
+            loss_fn=loss_fn,
+            device=device
+        )
+
+        for epoch in range(epochs):
+            print(f"\n--- Epoch {epoch + 1}/{epochs} ---")
+
+            avg_train_loss = trainer.train_epoch(train_dataloader)
+            print(f"Average Training Loss: {avg_train_loss:.4f}")
+
+            if eval_dataloader:
+                avg_eval_loss = trainer.eval_epoch(eval_dataloader)
+                print(f"Average Validation Loss: {avg_eval_loss:.4f}")
+
 
     @classmethod
     def from_pretrained(
