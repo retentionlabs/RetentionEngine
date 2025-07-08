@@ -1,10 +1,10 @@
 from thelethe.titans import PretrainedTitansConfig, PreTrainedTitansModel
 from transformers import PreTrainedModel, AutoTokenizer
-from torch.optim import AdamW
 from torch import nn
+from torch.optim import AdamW
 
-from ..utils import Trainer
-from ..data import get_oasst_dataloader
+from ..utils import Adapter
+from ..datasets import get_pg19_dataloader
 
 
 class RetentionEngine(nn.Module):
@@ -27,41 +27,51 @@ class RetentionEngine(nn.Module):
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)
 
-    def adapt(
-        self,
+    def adapt(self,
         tokenizer: AutoTokenizer,
-        epochs: int = 1,
-        batch_size: int = 4,
-        learning_rate: float = 1e-5,
-        train_lang: str = None,
-        eval_lang: str = None,
-        device: str = "cuda"
+        epochs: int = 3,
+        batch_size: int = 1,
+        max_length: int = 8192,
+        learning_rate: float = 2e-5,
+
+        alpha: float = 0.3,
+        temperature: float = 2.0
     ):
 
-        train_dataloader = get_oasst_dataloader(tokenizer, batch_size, split='train', lang=train_lang)
-        eval_dataloader = None
-        if eval_lang:
-            eval_dataloader = get_oasst_dataloader(tokenizer, batch_size, split='validation', lang=eval_lang)
+        device = self.module.device
+        # 2. 모델 역할 정의 및 설정 🧑‍🏫
+        adapt_model = self.module
+        base_model = self.module.model
+        base_model.eval()
+        for param in base_model.parameters():
+            param.requires_grad = False
+        for param in adapt_model.attention_module.parameters():
+            param.requires_grad = False # Attention 모듈은 학습하지 않음
+        adapt_model.train()
 
-        optimizer = AdamW(self.parameters(), lr=learning_rate)
-        loss_fn = nn.CrossEntropyLoss()
+        train_dataloader = get_pg19_dataloader(tokenizer, batch_size, 'train', max_length)
+        eval_dataloader = get_pg19_dataloader(tokenizer, batch_size, 'validation', max_length)
 
-        trainer = Trainer(
-            model=self,
+        # 4. 옵티마이저 설정 ✍️
+        optimizer = AdamW(adapt_model.parameters(), lr=learning_rate)
+
+        # 5. 증류 학습 트레이너 설정
+        trainer = Adapter(
+            adapt_model=adapt_model,
+            base_model=base_model,
             optimizer=optimizer,
-            loss_fn=loss_fn,
-            device=device
+            device=device,
+            alpha=alpha,
+            temperature=temperature
         )
 
         for epoch in range(epochs):
             print(f"\n--- Epoch {epoch + 1}/{epochs} ---")
+            train_loss = trainer.train_epoch(train_dataloader)
+            eval_loss = trainer.eval_epoch(eval_dataloader)
+            print(f"Epoch {epoch + 1} | Train Loss: {train_loss:.4f} | Eval Loss: {eval_loss:.4f}")
+        
 
-            avg_train_loss = trainer.train_epoch(train_dataloader)
-            print(f"Average Training Loss: {avg_train_loss:.4f}")
-
-            if eval_dataloader:
-                avg_eval_loss = trainer.eval_epoch(eval_dataloader)
-                print(f"Average Validation Loss: {avg_eval_loss:.4f}")
 
 
     @classmethod
