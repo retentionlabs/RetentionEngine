@@ -1,1 +1,1 @@
-from .adapter import Trainer
+from .adapter import Adapter
