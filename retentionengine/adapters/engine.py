@@ -39,23 +39,20 @@ class RetentionEngine(nn.Module):
     ):
 
         device = self.module.device
-        # 2. 모델 역할 정의 및 설정 🧑‍🏫
         adapt_model = self.module
         base_model = self.module.model
         base_model.eval()
         for param in base_model.parameters():
             param.requires_grad = False
         for param in adapt_model.attention_module.parameters():
-            param.requires_grad = False # Attention 모듈은 학습하지 않음
+            param.requires_grad = False # dont trian attention module
         adapt_model.train()
 
         train_dataloader = get_pg19_dataloader(tokenizer, batch_size, 'train', max_length)
         eval_dataloader = get_pg19_dataloader(tokenizer, batch_size, 'validation', max_length)
 
-        # 4. 옵티마이저 설정 ✍️
         optimizer = AdamW(adapt_model.parameters(), lr=learning_rate)
 
-        # 5. 증류 학습 트레이너 설정
         trainer = Adapter(
             adapt_model=adapt_model,
             base_model=base_model,
@@ -96,3 +93,4 @@ class RetentionEngine(nn.Module):
         """
         self.module.save_pretrained(save_directory)
         self.config.save_pretrained(save_directory)
+        
