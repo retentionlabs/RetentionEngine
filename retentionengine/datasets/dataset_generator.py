@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Qwen3-based Memory Module Training Dataset Generator (Stabilized Version)
+Qwen2-based Memory Module Training Dataset Generator (Stabilized Version)
 ----------------------------------------------------------------------
-Generated data: RETENTIONENGINE/retentionengine/datasets/qwen3_memory_aligned_dataset.jsonl
+Generated data: RETENTIONENGINE/retentionengine/datasets/qwen2_memory_aligned_dataset.jsonl
 → Includes 2/3 Korean and 1/3 English samples.
 """
 
@@ -12,11 +12,12 @@ import time
 import random
 import uuid
 from typing import List, Dict
+import os  # Added for directory creation
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
-import json_repair  # Library for repairing malformed JSON
+import json_repair  # Library for repairing malformed JSON; install via: pip install json-repair
 
-def make_seed_prompt(batch_size: int = 100) -> str:
+def make_seed_prompt(batch_size: int = 25) -> str:  # Reduced default for faster testing
     """
     Return a Korean prompt with 2/3 probability, and an English prompt with 1/3 probability.
     """
@@ -25,8 +26,7 @@ def make_seed_prompt(batch_size: int = 100) -> str:
     else:
         return make_seed_prompt_korean(batch_size)
 
-
-def make_seed_prompt_korean(batch_size: int = 5) -> str:
+def make_seed_prompt_korean(batch_size: int = 25) -> str:
     """
     Korean prompt
     """
@@ -43,7 +43,7 @@ def make_seed_prompt_korean(batch_size: int = 5) -> str:
   "id": "sample_001",
   "domain": "예: math, physics, literature, cs, philosophy 등",
   "input": "장문 또는 단문 입력. 다양한 도메인 혼합 가능",
-  "target_output": "Qwen3이 생성할 것으로 예상되는 출력",
+  "target_output": "Qwen2이 생성할 것으로 예상되는 출력",  # Updated to Qwen2
   "reasoning_trace": [
     {{
       "step": 1,
@@ -87,8 +87,7 @@ def make_seed_prompt_korean(batch_size: int = 5) -> str:
 """
     return prompt.strip()
 
-
-def make_seed_prompt_english(batch_size: int = 100) -> str:
+def make_seed_prompt_english(batch_size: int = 25) -> str:
     """
     English prompt (called with 1/3 probability)
     """
@@ -105,7 +104,7 @@ Generate a single JSON array containing exactly {batch_size} samples that follow
   "id": "sample_001",
   "domain": "e.g., math, physics, literature, cs, philosophy",
   "input": "Long or short input. Mix of domains allowed",
-  "target_output": "Output expected from Qwen3",
+  "target_output": "Output expected from Qwen2",  # Updated to Qwen2
   "reasoning_trace": [
     {{
       "step": 1,
@@ -135,7 +134,6 @@ Generate a single JSON array containing exactly {batch_size} samples that follow
 - Example: `[ {{"id": "...", ...}} ]`
 """
     return prompt.strip()
-
 
 def parse_json_array(text: str) -> List[Dict]:
     """
@@ -170,26 +168,30 @@ def parse_json_array(text: str) -> List[Dict]:
         print("⚠️ WARNING: Parsed data is not a list.")
         return []
 
-
 def generate_dataset(
     model_name: str,
     target_count: int = 10000,
-    batch_size: int = 100
+    batch_size: int = 25
 ):
     """
     Generate a dataset using the specified model and save it to a JSONL file.
     """
-    output_file = "qwen3_memory_aligned_dataset.jsonl"
+    output_dir = "RETENTIONENGINE/retentionengine/datasets"
+    output_file = os.path.join(output_dir, "qwen2_memory_aligned_dataset.jsonl")  # Updated name and path
+    os.makedirs(output_dir, exist_ok=True)  # Create dirs if needed
 
     print(f"🚀 Loading model: {model_name}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
-        torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    )
-
-    print(f"✅ Model loaded successfully. Output file: {output_file}")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="auto",
+            torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        )
+        print(f"✅ Model loaded successfully. Output file: {output_file}")
+    except Exception as e:
+        print(f"🆘 ERROR: Failed to load model: {e}")
+        return []  # Early exit on load failure
 
     generated_samples = []
     
@@ -215,51 +217,55 @@ def generate_dataset(
             # Set a reasonable generation cap and respect the model's context length (32768 for Qwen2)
             max_new = min(16000, 32768 - input_len - 10)
 
-            with torch.no_grad():
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=max_new,
-                    temperature=0.5,
-                    do_sample=True,
-                    top_p=0.9,
-                    eos_token_id=tokenizer.eos_token_id,
-                    pad_token_id=tokenizer.eos_token_id
-                )
+            try:
+                with torch.no_grad():
+                    outputs = model.generate(
+                        **inputs,
+                        max_new_tokens=max_new,
+                        temperature=0.5,
+                        do_sample=True,
+                        top_p=0.9,
+                        eos_token_id=tokenizer.eos_token_id,
+                        pad_token_id=tokenizer.eos_token_id
+                    )
 
-            # Decode only the newly generated tokens
-            input_token_length = inputs["input_ids"].shape[1]
-            generated_tokens = outputs[0][input_token_length:]
-            content = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+                # Decode only the newly generated tokens
+                input_token_length = inputs["input_ids"].shape[1]
+                generated_tokens = outputs[0][input_token_length:]
+                content = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
-            new_samples = parse_json_array(content)
-            print(f"✅ Extracted {len(new_samples)} valid samples from this batch.")
+                new_samples = parse_json_array(content)
+                print(f"✅ Extracted {len(new_samples)} valid samples from this batch.")
 
-            if not new_samples:
-                print("⚠️ Failed to generate valid samples in this batch. Retrying after a delay.")
+                if not new_samples:
+                    print("⚠️ Failed to generate valid samples in this batch. Retrying after a delay.")
+                    time.sleep(5)
+                    continue
+
+                for sample in new_samples:
+                    if len(generated_samples) >= target_count:
+                        break
+                    sample["id"] = str(uuid.uuid4())  # Assign a unique ID
+                    f_out.write(json.dumps(sample, ensure_ascii=False) + "\n")
+                    generated_samples.append(sample)
+                
+                f_out.flush()  # Write data to disk periodically
+                print(f"📊 Total generated: {len(generated_samples)} / {target_count}")
+
+                time.sleep(2)  # Small delay between API calls
+            except Exception as e:
+                print(f"🆘 ERROR during generation: {e}. Retrying after delay.")
                 time.sleep(5)
                 continue
-
-            for sample in new_samples:
-                if len(generated_samples) >= target_count:
-                    break
-                sample["id"] = str(uuid.uuid4())  # Assign a unique ID
-                f_out.write(json.dumps(sample, ensure_ascii=False) + "\n")
-                generated_samples.append(sample)
-            
-            f_out.flush()  # Write data to disk periodically
-            print(f"📊 Total generated: {len(generated_samples)} / {target_count}")
-
-            time.sleep(2)  # Small delay between API calls
 
     print(f"\n🎉 Generation successfully completed!")
     print(f"📁 Data saved to: {output_file}")
     print(f"📊 Total samples generated: {len(generated_samples)}")
     return generated_samples
 
-
 if __name__ == "__main__":
-    samples = generate_dataset(
-        model_name="Qwen/Qwen3-8B-Instruct",
+    generate_dataset(
+        model_name="Qwen/Qwen2-7B-Instruct",  # Fixed to a real model; adjust size if needed (e.g., -1.5B for smaller)
         target_count=5000,
         batch_size=25
     )
