@@ -15,7 +15,7 @@ import uuid
 from typing import List, Dict
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
-import json_repair
+import json_repair # 🟢 라이브러리 다시 임포트
 
 
 def make_seed_prompt(batch_size: int = 100) -> str:
@@ -71,8 +71,21 @@ def make_seed_prompt_korean(batch_size: int = 5) -> str:
 - 도메인 분포: {domain_str}
 - reasoning_trace는 2~5단계 포함
 - memory_read/write는 실제 메모리 블록 이름 사용 (예: physics_laws_v1, literature_themes_02)
+- 문자열 내부에 따옴표(\")가 있다면 반드시 백슬래시(\\)로 이스케이프 처리해줘 (예: `\"`).
 - 오직 하나의 완성된 JSON 배열만 출력해줘. 설명, 마크다운, ```json``` 태그는 절대 포함하지 마.
-- 예시: `[ {{...}}, {{...}}, ... ]`
+
+### 완벽한 출력 예시:
+[
+  {{
+    "id": "temp_001",
+    "domain": "literature",
+    "input": "소설 '데미안'의 주제는 무엇인가?",
+    "target_output": "헤르만 헤세의 소설 '데미안'의 핵심 주제는 개인의 자아 발견과 성장 과정입니다. 주인공 싱클레어가 알을 깨고 나오듯, 기존의 세계를 벗어나 자기 자신만의 길을 찾아가는 과정을 그립니다.",
+    "reasoning_trace": [],
+    "memory_access_pattern": {{"reads": [], "writes": []}},
+    "metadata": {{"context_length": 50, "reasoning_depth": "trivial"}}
+  }}
+]
 """
     return prompt.strip()
 
@@ -121,12 +134,11 @@ Generate a single JSON array containing exactly {batch_size} samples that follow
 - reasoning_trace must have 2-5 steps
 - Use realistic memory block names (e.g., physics_laws_v1, literature_themes_02)
 - Output only a single, complete JSON array. Do not include any explanation, markdown, or ```json``` tags.
-- Example: `[ {{...}}, {{...}}, ... ]`
+- Example: `[ {{"id": "...", ...}} ]`
 """
     return prompt.strip()
 
 
-# [수정] JSON 배열을 안정적으로 파싱하는 함수
 def parse_json_array(text: str) -> List[Dict]:
     """
     생성된 텍스트에서 유효한 JSON 배열을 추출
@@ -140,7 +152,14 @@ def parse_json_array(text: str) -> List[Dict]:
     try:
         data = json.loads(json_array_str)
     except json.JSONDecodeError:
-        data = json_repair.loads(json_array_str)
+        # 🟢 JSON 디코딩 실패 시 json_repair로 복구 시도
+        print("⚠️ 경고: JSON 디코딩 실패. json_repair로 복구를 시도합니다.")
+        try:
+            data = json_repair.loads(json_array_str)
+        except Exception as e:
+            print(f"🆘 json_repair로도 복구 실패: {e}")
+            return []
+
 
     if isinstance(data, list):
         valid_items = [
@@ -160,12 +179,10 @@ def generate_dataset(
     """
     Qwen3을 사용해 데이터셋을 생성하고, 지정된 경로에 저장
     """
-    output_dir = os.path.join("retentionengine", "datasets")
-    os.makedirs(output_dir, exist_ok=True)
-    output_file = os.path.join(output_dir, "qwen3_memory_aligned_dataset.jsonl")
+    output_file = "qwen3_memory_aligned_dataset.jsonl"
 
     print("🚀 모델을 로딩 중입니다... (Qwen/Qwen2-7B-Instruct)")
-    model_name = "Qwen/Qwen2-7B-Instruct" 
+    model_name = "Qwen/Qwen2-7B-Instruct"
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
@@ -174,7 +191,7 @@ def generate_dataset(
         torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     )
 
-    print(f"✅ 모델 로딩 완료. 저장 위치: {os.path.abspath(output_file)}")
+    print(f"✅ 모델 로딩 완료. 저장 위치: {output_file}")
 
     generated_samples = []
     
@@ -186,22 +203,22 @@ def generate_dataset(
 
             prompt = make_seed_prompt(current_batch_size)
             
-            messages = [
-                {"role": "system", "content": "You are a helpful assistant that generates high-quality synthetic data."},
-                {"role": "user", "content": prompt}
-            ]
-            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            inputs = tokenizer(text, return_tensors="pt").to(model.device)
+            system_prompt = "<|im_start|>system\nYou are a helpful assistant that generates high-quality synthetic data.<|im_end|>"
+            user_prompt = f"<|im_start|>user\n{prompt}<|im_end|>"
+            assistant_prompt = "<|im_start|>assistant"
+            
+            final_text = f"{system_prompt}\n{user_prompt}\n{assistant_prompt}"
+            
+            inputs = tokenizer(final_text, return_tensors="pt").to(model.device)
 
-            # 안전한 max_new_tokens 계산
             input_len = inputs["input_ids"].shape[1]
-            max_new = min(16000, model.config.max_position_embeddings - input_len)
+            max_new = min(16000, 32768 - input_len - 10)
 
             with torch.no_grad():
                 outputs = model.generate(
                     **inputs,
                     max_new_tokens=max_new,
-                    temperature=0.8,
+                    temperature=0.5,
                     do_sample=True,
                     top_p=0.9,
                     eos_token_id=tokenizer.eos_token_id,
@@ -223,7 +240,7 @@ def generate_dataset(
             for sample in new_samples:
                 if len(generated_samples) >= target_count:
                     break
-                sample["id"] = str(uuid.uuid4())  # uuid 기반 ID
+                sample["id"] = str(uuid.uuid4())
                 f_out.write(json.dumps(sample, ensure_ascii=False) + "\n")
                 generated_samples.append(sample)
             
@@ -233,7 +250,7 @@ def generate_dataset(
             time.sleep(2)
 
     print(f"\n🎉 성공적으로 완료!")
-    print(f"📁 저장 위치: {os.path.abspath(output_file)}")
+    print(f"📁 저장 위치: {output_file}")
     print(f"📊 총 생성된 샘플 수: {len(generated_samples)}")
     return generated_samples
 
