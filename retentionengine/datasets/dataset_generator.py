@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Qwen3 기반 메모리 모듈 학습용 데이터셋 생성기 (안정화 버전)
-------------------------------------------------
-생성된 데이터: RETENTIONENGINE/retentionengine/datasets/qwen3_memory_aligned_dataset.jsonl
-→ 2/3 한국어, 1/3 영어 샘플 포함
+Qwen3-based Memory Module Training Dataset Generator (Stabilized Version)
+----------------------------------------------------------------------
+Generated data: RETENTIONENGINE/retentionengine/datasets/qwen3_memory_aligned_dataset.jsonl
+→ Includes 2/3 Korean and 1/3 English samples.
 """
 
-import os
 import json
 import re
 import time
@@ -15,14 +14,13 @@ import uuid
 from typing import List, Dict
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
-import json_repair # 🟢 라이브러리 다시 임포트
-
+import json_repair  # Library for repairing malformed JSON
 
 def make_seed_prompt(batch_size: int = 100) -> str:
     """
-    2/3 확률로 한국어, 1/3 확률로 영어 프롬프트 반환
+    Return a Korean prompt with 2/3 probability, and an English prompt with 1/3 probability.
     """
-    if random.random() < 0.33:  # 약 1/3 확률로 영어
+    if random.random() < 0.33:  # Approx. 1/3 probability for English
         return make_seed_prompt_english(batch_size)
     else:
         return make_seed_prompt_korean(batch_size)
@@ -30,7 +28,7 @@ def make_seed_prompt(batch_size: int = 100) -> str:
 
 def make_seed_prompt_korean(batch_size: int = 5) -> str:
     """
-    한국어 프롬프트
+    Korean prompt
     """
     domains = [
         ("math", 20), ("cs", 20), ("physics", 15), ("literature", 15),
@@ -92,7 +90,7 @@ def make_seed_prompt_korean(batch_size: int = 5) -> str:
 
 def make_seed_prompt_english(batch_size: int = 100) -> str:
     """
-    영어 프롬프트 (1/3 확률로 호출)
+    English prompt (called with 1/3 probability)
     """
     domains = [
         ("math", 20), ("cs", 20), ("physics", 15), ("literature", 15),
@@ -141,49 +139,49 @@ Generate a single JSON array containing exactly {batch_size} samples that follow
 
 def parse_json_array(text: str) -> List[Dict]:
     """
-    생성된 텍스트에서 유효한 JSON 배열을 추출
+    Extract a valid JSON array from the generated text.
     """
+    # Find the first '[' and the last ']' to capture the array
     match = re.search(r'\[.*\]', text, re.DOTALL)
     if not match:
-        print("⚠️ 경고: 응답에서 JSON 배열을 찾지 못했습니다.")
+        print("⚠️ WARNING: Could not find a JSON array in the response.")
         return []
 
     json_array_str = match.group(0)
     try:
         data = json.loads(json_array_str)
     except json.JSONDecodeError:
-        # 🟢 JSON 디코딩 실패 시 json_repair로 복구 시도
-        print("⚠️ 경고: JSON 디코딩 실패. json_repair로 복구를 시도합니다.")
+        # If standard JSON decoding fails, attempt to repair with json_repair
+        print("⚠️ WARNING: JSON decoding failed. Attempting to repair with json_repair.")
         try:
             data = json_repair.loads(json_array_str)
         except Exception as e:
-            print(f"🆘 json_repair로도 복구 실패: {e}")
+            print(f"🆘 CRITICAL: Repair with json_repair also failed: {e}")
             return []
 
-
     if isinstance(data, list):
+        # Ensure all items in the list are dicts with the required keys
         valid_items = [
             item for item in data
             if isinstance(item, dict) and "input" in item and "target_output" in item
         ]
         return valid_items
     else:
-        print("⚠️ 경고: 파싱된 데이터가 리스트가 아닙니다.")
+        print("⚠️ WARNING: Parsed data is not a list.")
         return []
 
 
 def generate_dataset(
+    model_name: str,
     target_count: int = 10000,
     batch_size: int = 100
 ):
     """
-    Qwen3을 사용해 데이터셋을 생성하고, 지정된 경로에 저장
+    Generate a dataset using the specified model and save it to a JSONL file.
     """
     output_file = "qwen3_memory_aligned_dataset.jsonl"
 
-    print("🚀 모델을 로딩 중입니다... (Qwen/Qwen2-7B-Instruct)")
-    model_name = "Qwen/Qwen2-7B-Instruct"
-
+    print(f"🚀 Loading model: {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
@@ -191,7 +189,7 @@ def generate_dataset(
         torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     )
 
-    print(f"✅ 모델 로딩 완료. 저장 위치: {output_file}")
+    print(f"✅ Model loaded successfully. Output file: {output_file}")
 
     generated_samples = []
     
@@ -199,10 +197,11 @@ def generate_dataset(
         while len(generated_samples) < target_count:
             remaining = target_count - len(generated_samples)
             current_batch_size = min(batch_size, remaining)
-            print(f"🔄 생성 중: {len(generated_samples)} / {target_count} | 이번 배치: {current_batch_size}")
+            print(f"🔄 Generating: {len(generated_samples)} / {target_count} | Current batch size: {current_batch_size}")
 
             prompt = make_seed_prompt(current_batch_size)
             
+            # Apply the Qwen2 chat template
             system_prompt = "<|im_start|>system\nYou are a helpful assistant that generates high-quality synthetic data.<|im_end|>"
             user_prompt = f"<|im_start|>user\n{prompt}<|im_end|>"
             assistant_prompt = "<|im_start|>assistant"
@@ -211,7 +210,9 @@ def generate_dataset(
             
             inputs = tokenizer(final_text, return_tensors="pt").to(model.device)
 
+            # Dynamically calculate max_new_tokens to avoid exceeding context window
             input_len = inputs["input_ids"].shape[1]
+            # Set a reasonable generation cap and respect the model's context length (32768 for Qwen2)
             max_new = min(16000, 32768 - input_len - 10)
 
             with torch.no_grad():
@@ -225,38 +226,40 @@ def generate_dataset(
                     pad_token_id=tokenizer.eos_token_id
                 )
 
+            # Decode only the newly generated tokens
             input_token_length = inputs["input_ids"].shape[1]
             generated_tokens = outputs[0][input_token_length:]
             content = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
             new_samples = parse_json_array(content)
-            print(f"✅ 이번 배치에서 {len(new_samples)}개의 유효한 샘플 추출")
+            print(f"✅ Extracted {len(new_samples)} valid samples from this batch.")
 
             if not new_samples:
-                print("⚠️ 이번 배치에서 유효한 샘플을 생성하지 못했습니다. 재시도합니다.")
+                print("⚠️ Failed to generate valid samples in this batch. Retrying after a delay.")
                 time.sleep(5)
                 continue
 
             for sample in new_samples:
                 if len(generated_samples) >= target_count:
                     break
-                sample["id"] = str(uuid.uuid4())
+                sample["id"] = str(uuid.uuid4())  # Assign a unique ID
                 f_out.write(json.dumps(sample, ensure_ascii=False) + "\n")
                 generated_samples.append(sample)
             
-            f_out.flush()
-            print(f"📊 누적 생성: {len(generated_samples)} / {target_count}")
+            f_out.flush()  # Write data to disk periodically
+            print(f"📊 Total generated: {len(generated_samples)} / {target_count}")
 
-            time.sleep(2)
+            time.sleep(2)  # Small delay between API calls
 
-    print(f"\n🎉 성공적으로 완료!")
-    print(f"📁 저장 위치: {output_file}")
-    print(f"📊 총 생성된 샘플 수: {len(generated_samples)}")
+    print(f"\n🎉 Generation successfully completed!")
+    print(f"📁 Data saved to: {output_file}")
+    print(f"📊 Total samples generated: {len(generated_samples)}")
     return generated_samples
 
 
 if __name__ == "__main__":
     samples = generate_dataset(
+        model_name="Qwen/Qwen3-8B-Instruct",
         target_count=5000,
         batch_size=25
     )
