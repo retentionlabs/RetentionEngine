@@ -2,6 +2,13 @@ import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset
 
+# `load_dataset("pg19")` resolves to deepmind/pg19, which only ships a loading script
+# (pg19.py): datasets>=4 no longer runs dataset scripts and its parquet conversion is
+# empty. emozilla/pg19 is a parquet copy with the same features and split sizes
+# (train 28,602 / validation 50 / test 100 books), pinned to a commit.
+PG19_DATASET = "emozilla/pg19"
+PG19_REVISION = "c021754c8e01c5b1cc83a1f549c1f97fbbb756b8"
+
 
 class LongTextDataset(Dataset):
     """Custom Dataset for formatting and tokenizing long text documents."""
@@ -48,6 +55,10 @@ def get_pg19_dataloader(tokenizer, batch_size, split="train", max_length=8192):
     """
     Creates a DataLoader for the PG19 dataset.
 
+    Loads the parquet copy ``PG19_DATASET`` at ``PG19_REVISION`` (the script-based
+    ``"pg19"`` repo cannot be loaded with datasets>=4). The train split downloads
+    about 7 GB of parquet files.
+
     Args:
         tokenizer: The tokenizer to use. Needs a pad token (e.g. ``tokenizer.pad_token = tokenizer.eos_token``).
         batch_size: The batch size for the DataLoader.
@@ -55,7 +66,7 @@ def get_pg19_dataloader(tokenizer, batch_size, split="train", max_length=8192):
         max_length: Tokens per sample (documents are truncated and padded to this length).
     """
     # PG19 데이터셋 로드
-    dataset = load_dataset("pg19", split=split)
+    dataset = load_dataset(PG19_DATASET, split=split, revision=PG19_REVISION)
 
     # Dataset 객체 생성
     longtext_dataset = LongTextDataset(dataset, tokenizer, max_length=max_length)
