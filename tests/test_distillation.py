@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import math
 import sys
@@ -7,7 +8,7 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from conftest import VOCAB_SIZE
+from conftest import VOCAB_SIZE, _tiny_llama
 from torch.utils.data import Dataset
 from transformers import TrainingArguments
 
@@ -176,21 +177,108 @@ def test_fp8_refuses_device_mapped_teacher(tiny_llama, tmp_path, monkeypatch):
     )
 
 
-def test_fp8_conversion_keeps_weights(monkeypatch):
+def _install_fake_te(monkeypatch, autocast_name="fp8_autocast"):
+    """Fake ``transformer_engine.pytorch`` with ``Linear`` and an FP8 autocast.
+
+    The autocast is exposed as ``fp8_autocast`` (older TE) or only as ``autocast``
+    (newer TE). Returns a namespace recording the autocast calls and whether each
+    fake ``te.Linear`` forward ran inside the autocast.
+    """
+    fake = types.SimpleNamespace(autocast_calls=[], active=False, inside=0, outside=0)
+
     class FakeTELinear(nn.Linear):
         def __init__(
             self, in_features, out_features, bias=True, params_dtype=None, device=None
-        ):
+        ):  # ignores `device`, so converted models stay on CPU
             super().__init__(in_features, out_features, bias=bias, dtype=params_dtype)
+
+        def forward(self, x):
+            if fake.active:
+                fake.inside += 1
+            else:
+                fake.outside += 1
+            return super().forward(x)
+
+    @contextlib.contextmanager
+    def autocast(enabled=False, **kwargs):
+        fake.autocast_calls.append(enabled)
+        fake.active = enabled
+        try:
+            yield
+        finally:
+            fake.active = False
 
     te_pkg = types.ModuleType("transformer_engine")
     te_pt = types.ModuleType("transformer_engine.pytorch")
     te_pt.Linear = FakeTELinear
+    setattr(te_pt, autocast_name, autocast)
     te_pkg.pytorch = te_pt
     monkeypatch.setitem(sys.modules, "transformer_engine", te_pkg)
     monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", te_pt)
+    fake.Linear = FakeTELinear
+    return fake
 
-    from conftest import _tiny_llama
+
+@pytest.mark.parametrize("autocast_name", ["fp8_autocast", "autocast"])
+def test_distillation_trainer_fp8_teacher(
+    tiny_llama, tmp_path, monkeypatch, autocast_name
+):
+    fake = _install_fake_te(monkeypatch, autocast_name)
+    teacher = copy.deepcopy(tiny_llama)
+    student = RetentionEngine(
+        tiny_llama, RetentionEngineConfig(layers_to_remove=1)
+    ).model
+
+    trainer = DistillationTrainer(
+        model=student,
+        teacher_model=teacher,
+        args=_args(tmp_path),
+        train_dataset=_ToyLMDataset(),
+        use_fp8_teacher=True,
+    )
+    assert isinstance(
+        trainer.teacher_model.model.layers[0].self_attn.q_proj, fake.Linear
+    )
+    assert not any(isinstance(m, fake.Linear) for m in student.modules())
+    trainer.train()
+
+    assert trainer.state.global_step == 2
+    losses = _losses(trainer)
+    assert len(losses) == 2 and all(math.isfinite(x) for x in losses)
+    # One teacher forward per step, each under FP8 autocast (the `autocast`
+    # parametrization covers the `te.autocast` fallback).
+    assert fake.autocast_calls == [True, True]
+    assert fake.inside > 0 and fake.outside == 0
+
+
+def test_fp8_conversion_skips_tied_weights(monkeypatch):
+    fake = _install_fake_te(monkeypatch)
+    tied = _tiny_llama()
+    tied.lm_head.weight = tied.model.embed_tokens.weight
+    untied = _tiny_llama()
+
+    # skip_modules=() so lm_head is not skipped by name: only the tie keeps it.
+    convert_to_fp8_layers(tied, skip_modules=())
+    convert_to_fp8_layers(untied, skip_modules=())
+
+    assert type(tied.lm_head) is nn.Linear
+    assert tied.lm_head.weight is tied.model.embed_tokens.weight
+    assert isinstance(tied.model.layers[0].mlp.down_proj, fake.Linear)
+    assert isinstance(untied.lm_head, fake.Linear)
+
+
+def test_fp8_conversion_skips_dims_not_multiple_of_16(monkeypatch):
+    fake = _install_fake_te(monkeypatch)
+    model = nn.Sequential(nn.Linear(32, 48), nn.Linear(48, 24), nn.Linear(24, 32))
+
+    convert_to_fp8_layers(model)
+
+    # out_features=24 and in_features=24 are not FP8 GEMM-compatible.
+    assert [type(m) for m in model] == [fake.Linear, nn.Linear, nn.Linear]
+
+
+def test_fp8_conversion_keeps_weights(monkeypatch):
+    fake = _install_fake_te(monkeypatch)
 
     torch.manual_seed(0)
     model = _tiny_llama()
@@ -203,8 +291,8 @@ def test_fp8_conversion_keeps_weights(monkeypatch):
 
     convert_to_fp8_layers(model)  # the fake ignores `device`, so this stays on CPU
 
-    assert isinstance(model.model.layers[0].self_attn.q_proj, FakeTELinear)
-    assert isinstance(model.model.layers[0].mlp.down_proj, FakeTELinear)
+    assert isinstance(model.model.layers[0].self_attn.q_proj, fake.Linear)
+    assert isinstance(model.model.layers[0].mlp.down_proj, fake.Linear)
     assert type(model.lm_head) is nn.Linear  # skipped: lm_head / tied to embeddings
     assert torch.equal(model.model.layers[0].self_attn.q_proj.weight, q_proj)
     with torch.no_grad():
