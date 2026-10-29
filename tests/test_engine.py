@@ -138,6 +138,22 @@ def test_auto_resize_uses_budget(tiny_llama):
         )
 
 
+def test_min_layers_must_keep_a_layer(tiny_llama):
+    # min_layers=0 would let auto_resize remove every layer.
+    with pytest.raises(ValueError, match="min_layers"):
+        RetentionEngineConfig(max_total_params=1, min_layers=0)
+    with pytest.raises(ValueError, match="min_layers"):
+        ModelSizeManager.calculate_layers_to_remove(tiny_llama, 0, 1, min_layers=0)
+
+    # min_layers=1 under an impossible budget keeps exactly one layer.
+    engine = RetentionEngine(
+        tiny_llama,
+        RetentionEngineConfig(max_total_params=1, min_layers=1),
+        auto_resize=True,
+    )
+    assert engine.model.config.num_hidden_layers == 1
+
+
 def test_size_info_counts_each_param_once(tiny_llama):
     engine = RetentionEngine(tiny_llama, RetentionEngineConfig(layers_to_remove=1))
     info = engine.get_model_size_info()

@@ -41,7 +41,7 @@ class RetentionEngineConfig:
         max_total_params: Parameter budget used when ``auto_resize=True``.
         module_params: Parameters reserved for a future memory module; counted
             against ``max_total_params`` by ``auto_resize``.
-        min_layers: Minimum number of layers ``auto_resize`` keeps.
+        min_layers: Minimum number of layers ``auto_resize`` keeps (>= 1).
         base_model_name: Name/path of the base model (filled in if ``None``).
 
     Record fields (filled in by `RetentionEngine`, do not set by hand):
@@ -57,6 +57,12 @@ class RetentionEngineConfig:
     original_num_layers: Optional[int] = None
     base_model_params: Optional[int] = None
     removed_layer_indices: List[int] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.min_layers < 1:
+            raise ValueError(
+                f"min_layers must be >= 1 (a model needs a decoder layer), got {self.min_layers}"
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -195,6 +201,8 @@ class ModelSizeManager:
         min_layers: int = 4,
     ) -> int:
         """Number of layers to remove so that base + module params fit the budget."""
+        if min_layers < 1:
+            raise ValueError(f"min_layers must be >= 1, got {min_layers}")
         total = ModelSizeManager.count_parameters(base_model) + module_params
         if total <= max_total_params:
             return 0
