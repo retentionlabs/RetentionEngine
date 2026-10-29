@@ -73,6 +73,51 @@ def test_trim_forward_and_cached_generation(tiny_model):
     assert torch.equal(cached, uncached)
 
 
+@pytest.mark.parametrize("removal_start", [None, 0])
+def test_qwen3_trimmed_cached_generation_past_sliding_window(removal_start):
+    from conftest import _tiny_qwen3
+
+    torch.manual_seed(0)
+    model = _tiny_qwen3()
+    window = model.config.sliding_window
+    engine = RetentionEngine(
+        model, RetentionEngineConfig(layers_to_remove=1, removal_start=removal_start)
+    )
+    sliding = [
+        layer.self_attn.sliding_window is not None for layer in model.model.layers
+    ]
+    assert any(sliding) and not all(sliding)  # hybrid full/sliding stack
+
+    # 8 prompt + 32 new tokens = 40, well past the 16-token window.
+    input_ids = _input_ids()
+    gen_kwargs = dict(
+        max_new_tokens=2 * window,
+        do_sample=False,
+        pad_token_id=0,
+        return_dict_in_generate=True,
+        output_logits=True,
+    )
+    with torch.no_grad():
+        cached = engine.generate(input_ids, use_cache=True, **gen_kwargs)
+        uncached = engine.generate(input_ids, use_cache=False, **gen_kwargs)
+
+    total = input_ids.shape[1] + 2 * window
+    assert cached.sequences.shape == (2, total)
+    assert torch.equal(cached.sequences, uncached.sequences)
+    # Logits too: the window changes them once the sequence exceeds it, so a cache
+    # that mixed up the (renumbered) full/sliding layers would not match.
+    assert torch.allclose(
+        torch.stack(cached.logits), torch.stack(uncached.logits), atol=1e-5
+    )
+
+    cache_layers = getattr(cached.past_key_values, "layers", None)
+    if cache_layers is not None:  # transformers versions with per-layer caches
+        kv_lens = [layer.keys.shape[-2] for layer in cache_layers]
+        assert len(kv_lens) == len(sliding)
+        for kv_len, is_sliding in zip(kv_lens, sliding):
+            assert kv_len <= window if is_sliding else kv_len == total - 1
+
+
 @pytest.mark.parametrize("removal_start, kept", [(None, [0, 1, 3]), (0, [1, 2, 3])])
 def test_qwen3_sliding_window_layout_survives_trim_and_reload(
     tmp_path, removal_start, kept
