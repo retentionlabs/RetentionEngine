@@ -5,9 +5,9 @@ build-backend = "flit_core.buildapi"
 [project]
 name = "retentionengine"
 version = "0.0.1"
-description = "A simple adapter implementation to transform pretrained Transformer-family models into the Titans architecture."
+description = "Trim layers of pretrained Transformer models and restore their quality with knowledge distillation."
 readme = "README.md"
-requires-python = ">=3.9, <3.14"
+requires-python = ">=3.10, <3.14"
 license = {file = "LICENSE"}
 authors = [
     {name = "RetentionLabs", email = "retentionlabs.ai@gmail.com"}
@@ -17,7 +17,6 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -27,10 +26,25 @@ classifiers = [
 dependencies = [
     "numpy",
     "torch>=2.0.0",
-    "transformers>=4.30.0"
+    "transformers>=4.51"
 ]
 
 [project.optional-dependencies]
+train = [
+    "datasets",
+    "wandb",
+    "accelerate>=0.26.0",
+]
+fp8 = [
+    "transformer-engine[pytorch]",
+]
+datagen = [
+    "json-repair",
+]
+# Titans memory-module integration is planned; nothing in the package imports thelethe yet.
+titans = [
+    "thelethe @ git+https://github.com/retentionlabs/theRiverLethe@4e2d3f659bfaf111db75345f13271d6afc899267",
+]
 dev = [
     "pytest>=7.0.0",
     "black>=23.0.0",
@@ -40,6 +54,14 @@ dev = [
 docs = [
     "sphinx>=6.0.0",
     "sphinx-rtd-theme>=1.2.0",
+]
+
+# Installed by `uv run` / `uv sync` by default; enough to run the CPU smoke tests.
+[dependency-groups]
+dev = [
+    "pytest>=7.0.0",
+    "accelerate>=0.26.0",
+    "datasets",
 ]
 
 [project.urls]
@@ -52,15 +74,18 @@ name = "retentionengine"
 
 [tool.black]
 line-length = 88
-target-version = ["py39", "py310", "py311", "py312"]
+target-version = ["py310", "py311", "py312"]
 
 [tool.isort]
 profile = "black"
 line_length = 88
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
