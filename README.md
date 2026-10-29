@@ -17,7 +17,7 @@ uv venv && uv pip install -e ".[train]"
 |---|---|---|
 | `train` | datasets, wandb, accelerate | restoration training / notebooks |
 | `fp8` | transformer-engine[pytorch] | FP8 teacher (`use_fp8_teacher=True`, CUDA GPU) |
-| `datagen` | json-repair | `scripts/dataset_generator.py` |
+| `datagen` | json-repair, accelerate | `scripts/dataset_generator.py` |
 | `titans` | thelethe (pinned git commit) | future Titans integration (not used yet) |
 
 ## Usage

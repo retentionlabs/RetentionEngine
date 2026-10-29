@@ -17,9 +17,10 @@ import json
 import os
 import random
 import re
+import sys
 import time
 import uuid
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import json_repair  # Repairs malformed JSON; install via: pip install json-repair
 import torch
@@ -230,6 +231,7 @@ def generate_dataset(
     Generate a dataset using the specified model and save it to a JSONL file.
 
     Stops early if ``max_retries`` consecutive batches yield no valid samples.
+    Raises ``RuntimeError`` if the model or tokenizer cannot be loaded.
     """
     output_dir = os.path.dirname(output_file)
     if output_dir:
@@ -246,8 +248,7 @@ def generate_dataset(
         )
         print(f"✅ Model loaded successfully. Output file: {output_file}")
     except Exception as e:
-        print(f"🆘 ERROR: Failed to load model: {e}")
-        return []  # Early exit on load failure
+        raise RuntimeError(f"Failed to load model {model_name!r}: {e}") from e
 
     context_length = getattr(model.config, "max_position_embeddings", 32768)
     generated_samples = []
@@ -327,7 +328,7 @@ def generate_dataset(
     return generated_samples
 
 
-def parse_args():
+def parse_args(argv: Optional[List[str]] = None):
     parser = argparse.ArgumentParser(
         description="Generate a memory-aligned restoration dataset (JSONL)."
     )
@@ -358,15 +359,16 @@ def parse_args():
         default=None,
         help="Random seed for prompt language selection.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-if __name__ == "__main__":
-    args = parse_args()
+def main(argv: Optional[List[str]] = None) -> int:
+    """CLI entry point. Returns 1 (failure) when no sample was written."""
+    args = parse_args(argv)
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
-    generate_dataset(
+    samples = generate_dataset(
         model_name=args.model_name,
         output_file=args.output,
         target_count=args.target_count,
@@ -374,3 +376,11 @@ if __name__ == "__main__":
         max_new_tokens=args.max_new_tokens,
         max_retries=args.max_retries,
     )
+    if not samples:
+        print(f"🆘 ERROR: No samples were written to {args.output}.", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

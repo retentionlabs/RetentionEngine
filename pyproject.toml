@@ -40,6 +40,8 @@ fp8 = [
 ]
 datagen = [
     "json-repair",
+    # scripts/dataset_generator.py loads the model with device_map="auto".
+    "accelerate>=0.26.0",
 ]
 # Titans memory-module integration is planned; nothing in the package imports thelethe yet.
 titans = [
@@ -62,6 +64,7 @@ dev = [
     "pytest>=7.0.0",
     "accelerate>=0.26.0",
     "datasets",
+    "json-repair",
 ]
 
 [tool.uv]
