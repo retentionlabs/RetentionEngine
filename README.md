@@ -10,8 +10,10 @@ Trim layers of pretrained Transformer models (Llama / Qwen families) and restore
 ```bash
 git clone https://github.com/retentionlabs/RetentionEngine.git
 cd RetentionEngine
-uv venv && uv pip install -e ".[train]"
+uv venv && uv pip install -e ".[train,datagen]"
+source .venv/bin/activate  # the Usage steps below run in this venv
 ```
+`datagen` is needed for step 2 of Usage (`scripts/dataset_generator.py`). To run the notebooks, use a Jupyter kernel from this venv (e.g. `uv pip install ipykernel`).
 
 | Extra | Installs | Needed for |
 |---|---|---|
