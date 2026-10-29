@@ -33,7 +33,21 @@ def convert_to_fp8_layers(
     dimensions are not multiples of 16 (an FP8 GEMM requirement).
     Run the converted model under ``fp8_autocast`` (DistillationTrainer does
     this when ``use_fp8_teacher=True``).
+
+    Device-mapped/offloaded models (``device_map=...``, accelerate hooks) are
+    refused: the new layers would all land on one GPU and the hooks would be lost.
     """
+    if any(
+        getattr(m, "hf_device_map", None) is not None or hasattr(m, "_hf_hook")
+        for m in module.modules()
+    ):
+        raise ValueError(
+            "FP8 conversion does not support device-mapped or offloaded models "
+            "(loaded with `device_map=` / dispatched by accelerate): every te.Linear "
+            "would be created on one CUDA device and accelerate's hooks dropped. Load "
+            "the FP8 teacher on a single GPU without `device_map`, or keep the bf16 "
+            "teacher (use_fp8_teacher=False)."
+        )
     te = _import_transformer_engine()
 
     tied_ptrs = set()
@@ -158,6 +172,7 @@ class DistillationTrainer(Trainer):
         self.use_fp8_teacher = use_fp8_teacher
 
         if use_fp8_teacher:
+            # Refuses device-mapped teachers before converting anything.
             teacher_model = convert_to_fp8_layers(teacher_model)
         if getattr(teacher_model, "hf_device_map", None) is None:
             teacher_model.to(self.args.device)

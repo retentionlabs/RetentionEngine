@@ -151,6 +151,31 @@ def test_fp8_conversion_requires_transformer_engine(tiny_llama, monkeypatch):
         convert_to_fp8_layers(tiny_llama)
 
 
+def test_fp8_refuses_device_mapped_teacher(tiny_llama, tmp_path, monkeypatch):
+    # Refused before Transformer Engine is imported or any layer is replaced.
+    monkeypatch.setitem(sys.modules, "transformer_engine", None)
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", None)
+    teacher = copy.deepcopy(tiny_llama)
+    teacher.hf_device_map = {"": "cpu"}
+    student = RetentionEngine(
+        tiny_llama, RetentionEngineConfig(layers_to_remove=1)
+    ).model
+
+    with pytest.raises(ValueError, match="device_map"):
+        DistillationTrainer(
+            model=student,
+            teacher_model=teacher,
+            args=_args(tmp_path),
+            train_dataset=_ToyLMDataset(),
+            use_fp8_teacher=True,
+        )
+    with pytest.raises(ValueError, match="device_map"):
+        convert_to_fp8_layers(_NoLabelsTeacher(teacher))  # map on a submodule
+    assert all(
+        type(m) is nn.Linear for m in teacher.modules() if isinstance(m, nn.Linear)
+    )
+
+
 def test_fp8_conversion_keeps_weights(monkeypatch):
     class FakeTELinear(nn.Linear):
         def __init__(
