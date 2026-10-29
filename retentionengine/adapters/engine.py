@@ -363,7 +363,7 @@ class RetentionEngine(nn.Module):
     ) -> "RetentionEngine":
         """Load a model saved by `save_pretrained` (layers are not trimmed again).
 
-        ``model_kwargs`` go to ``AutoModelForCausalLM.from_pretrained`` (e.g. ``dtype``).
+        ``model_kwargs`` go to ``AutoModelForCausalLM.from_pretrained`` (e.g. ``torch_dtype``).
         The engine config is read from a local directory; without it the model is
         wrapped as-is.
         """
