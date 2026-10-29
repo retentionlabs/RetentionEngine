@@ -20,6 +20,7 @@ import re
 import sys
 import time
 import uuid
+from collections import Counter
 from typing import Dict, List, Optional
 
 import json_repair  # Repairs malformed JSON; install via: pip install json-repair
@@ -31,6 +32,7 @@ DEFAULT_OUTPUT = "data/qwen3_memory_aligned_dataset.jsonl"
 SYSTEM_PROMPT = (
     "You are a helpful assistant that generates high-quality synthetic data."
 )
+REQUIRED_KEYS = ("input", "target_output")
 
 
 def make_seed_prompt(batch_size: int = 25) -> str:  # Reduced default for faster testing
@@ -166,41 +168,85 @@ Generate a single JSON array containing exactly {batch_size} samples that follow
     return prompt.strip()
 
 
-def parse_json_array(text: str) -> List[Dict]:
+def is_valid_sample(item) -> bool:
+    """A sample needs a non-empty string for every key in ``REQUIRED_KEYS``."""
+    return isinstance(item, dict) and all(
+        isinstance(item.get(key), str) and item[key].strip() for key in REQUIRED_KEYS
+    )
+
+
+def json_structure_closed(text: str) -> bool:
+    """True if every ``[``/``{`` opened outside a string is closed and no string is left open.
+
+    Output cut off mid-array fails this; json_repair would otherwise "complete" it
+    into plausible-looking but truncated samples.
     """
-    Extract a valid JSON array from the generated text.
+    depth = 0
+    in_string = escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0 and not in_string
+
+
+def parse_json_array(text: str, stats: Optional[Counter] = None) -> List[Dict]:
     """
+    Extract the valid samples (see ``is_valid_sample``) of a JSON array in the generated text.
+
+    json_repair is only tried when strict parsing fails and the array is structurally
+    closed (``json_structure_closed``); truncated output is rejected, not repaired.
+    ``stats`` (optional) counts ``repaired`` samples (kept from a repaired array),
+    ``rejected`` samples (failed validation) and ``rejected_batches``.
+    """
+    stats = Counter() if stats is None else stats
     # Find the first '[' and the last ']' to capture the array
     match = re.search(r"\[.*\]", text, re.DOTALL)
     if not match:
         print("⚠️ WARNING: Could not find a JSON array in the response.")
+        stats["rejected_batches"] += 1
         return []
 
     json_array_str = match.group(0)
+    repaired = False
     try:
         data = json.loads(json_array_str)
     except json.JSONDecodeError:
-        # If standard JSON decoding fails, attempt to repair with json_repair
-        print(
-            "⚠️ WARNING: JSON decoding failed. Attempting to repair with json_repair."
-        )
+        if not json_structure_closed(json_array_str):
+            print("⚠️ WARNING: JSON array is not closed (truncated?); not repairing.")
+            stats["rejected_batches"] += 1
+            return []
+        print("⚠️ WARNING: JSON decoding failed. Attempting to repair with json_repair.")
         try:
             data = json_repair.loads(json_array_str)
         except Exception as e:
             print(f"🆘 CRITICAL: Repair with json_repair also failed: {e}")
+            stats["rejected_batches"] += 1
             return []
+        repaired = True
 
-    if isinstance(data, list):
-        # Ensure all items in the list are dicts with the required keys
-        valid_items = [
-            item
-            for item in data
-            if isinstance(item, dict) and "input" in item and "target_output" in item
-        ]
-        return valid_items
-    else:
+    if not isinstance(data, list):
         print("⚠️ WARNING: Parsed data is not a list.")
+        stats["rejected_batches"] += 1
         return []
+
+    valid_items = [item for item in data if is_valid_sample(item)]
+    stats["rejected"] += len(data) - len(valid_items)
+    if repaired:
+        stats["repaired"] += len(valid_items)
+    return valid_items
 
 
 def build_prompt_inputs(tokenizer, prompt: str):
@@ -231,7 +277,9 @@ def generate_dataset(
     Generate a dataset using the specified model and save it to a JSONL file.
 
     Stops early if ``max_retries`` consecutive batches yield no valid samples.
-    Raises ``RuntimeError`` if the model or tokenizer cannot be loaded.
+    A generation that stops at ``max_new_tokens`` without EOS is truncated and is
+    retried rather than repaired. Raises ``RuntimeError`` if the model or
+    tokenizer cannot be loaded.
     """
     output_dir = os.path.dirname(output_file)
     if output_dir:
@@ -253,6 +301,7 @@ def generate_dataset(
     context_length = getattr(model.config, "max_position_embeddings", 32768)
     generated_samples = []
     consecutive_failures = 0
+    stats = Counter()
 
     with open(output_file, "w", encoding="utf-8") as f_out:
         while len(generated_samples) < target_count:
@@ -287,11 +336,25 @@ def generate_dataset(
 
                 # Decode only the newly generated tokens
                 generated_tokens = outputs[0][input_len:]
+                # No final EOS: generation stopped at max_new_tokens and the JSON is
+                # truncated. Retry instead of letting json_repair complete it.
+                if (
+                    generated_tokens.numel() == 0
+                    or generated_tokens[-1].item() != tokenizer.eos_token_id
+                ):
+                    stats["truncated_batches"] += 1
+                    consecutive_failures += 1
+                    print(
+                        f"⚠️ Output hit max_new_tokens={max_new} without EOS (truncated); discarded ({consecutive_failures}/{max_retries}). Retrying after a delay."
+                    )
+                    time.sleep(5)
+                    continue
+
                 content = tokenizer.decode(
                     generated_tokens, skip_special_tokens=True
                 ).strip()
 
-                new_samples = parse_json_array(content)
+                new_samples = parse_json_array(content, stats)
                 print(f"✅ Extracted {len(new_samples)} valid samples from this batch.")
 
                 if not new_samples:
@@ -325,6 +388,12 @@ def generate_dataset(
     print("\n🎉 Generation finished.")
     print(f"📁 Data saved to: {output_file}")
     print(f"📊 Total samples generated: {len(generated_samples)}")
+    print(
+        f"🧾 Samples kept from json_repair'd arrays: {stats['repaired']} | "
+        f"samples rejected by validation: {stats['rejected']} | "
+        f"truncated generations: {stats['truncated_batches']} | "
+        f"other rejected batches: {stats['rejected_batches']}"
+    )
     return generated_samples
 
 

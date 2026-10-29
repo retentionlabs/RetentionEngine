@@ -142,3 +142,60 @@ def test_model_load_failure_exits_nonzero(tmp_path):
     assert proc.returncode != 0
     assert "Failed to load model" in proc.stderr
     assert not output.exists()
+
+
+def test_json_structure_closed():
+    closed = json.dumps([_sample(0), {"input": "a [b] {c}", "target_output": 'q"]'}])
+    assert gen.json_structure_closed(closed)
+    # Escaped quote `q\"]` must not end the string early.
+    for cut in (len(closed) - 1, closed.index("}") + 1, closed.index("[b]") + 3):
+        assert not gen.json_structure_closed(closed[:cut])
+    assert not gen.json_structure_closed("]")
+
+
+def test_truncated_array_is_rejected_not_repaired():
+    trace = [{"step": 1, "memory_read": ["m1"]}, {"step": 2, "memory_read": ["m2"]}]
+    full = json.dumps([_sample(0), {**_sample(1), "reasoning_trace": trace}])
+    # Cut inside the trace, right after an inner `]`: the regex still finds "[...]"
+    # and json_repair "completes" it into a valid-looking sample with a cut trace.
+    truncated = full[: full.index('["m1"]') + 6]
+    salvaged = gen.json_repair.loads(truncated)[-1]
+    assert gen.is_valid_sample(salvaged) and len(salvaged["reasoning_trace"]) == 1
+    assert gen.json_structure_closed(truncated) is False
+
+    stats = gen.Counter()
+    assert gen.parse_json_array(truncated, stats) == []
+    assert stats == {"rejected_batches": 1}
+
+
+def test_closed_array_is_repaired_and_validated():
+    # Closed but invalid JSON (trailing commas) -> repaired; invalid samples dropped.
+    text = (
+        'Sure: [{"input": "q0", "target_output": "a0",}, '
+        '{"input": "q1"}, {"input": "", "target_output": "a2"}, '
+        '{"input": "q3", "target_output": "a3"},]'
+    )
+    stats = gen.Counter()
+    samples = gen.parse_json_array(text, stats)
+    assert [s["input"] for s in samples] == ["q0", "q3"]
+    assert stats == {"repaired": 2, "rejected": 2}
+
+    stats = gen.Counter()
+    assert len(gen.parse_json_array(json.dumps([_sample(0)]), stats)) == 1
+    assert stats["repaired"] == 0
+
+
+def test_generation_without_eos_is_retried(monkeypatch, tmp_path, capsys):
+    trace = [{"step": 1, "memory_read": ["m1"]}, {"step": 2, "memory_read": ["m2"]}]
+    full = json.dumps([_sample(0), {**_sample(1), "reasoning_trace": trace}])
+    cut = full[: full.index('["m1"]') + 6]  # json_repair would salvage 2 samples
+    replies = [cut, json.dumps([_sample(2), _sample(3)])]
+    # 1st generation hits max_new_tokens (no EOS), 2nd finishes with EOS.
+    _install_fakes(monkeypatch, replies, [(0, False), (1, True)])
+    output = tmp_path / "out.jsonl"
+
+    assert gen.main(_cli_args(output)) == 0
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert [r["input"] for r in rows] == ["question 2", "question 3"]
+    out = capsys.readouterr().out
+    assert "truncated generations: 1" in out and "other rejected batches: 0" in out
