@@ -1,330 +1,379 @@
-from thelethe.titans import PretrainedTitansConfig, PreTrainedTitansModel
-from transformers import PreTrainedModel, AutoTokenizer, AutoConfig
-from torch import nn
-from torch.optim import AdamW
-import torch
-from typing import Optional, Dict, Any
+"""Layer trimming for pretrained decoder-only transformers (Llama / Qwen families).
+
+`RetentionEngine` wraps a Hugging Face causal LM, removes a contiguous block of
+decoder layers, and keeps the result a standard HF model so it can be saved,
+reloaded with `AutoModelForCausalLM.from_pretrained`, and restored with
+knowledge distillation (see `retentionengine.utils.DistillationTrainer`).
+
+The Titans memory-module integration (thelethe) is planned for a follow-up PR;
+`RetentionEngine.attach_memory_module` raises `NotImplementedError` until then.
+"""
+
+import copy
+import json
+import logging
 import math
+import os
+from dataclasses import asdict, dataclass, field, fields
+from typing import Any, Dict, List, Optional
+
+from torch import nn
+from transformers import AutoModelForCausalLM, PreTrainedModel
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_MAX_TOTAL_PARAMS = 8_000_000_000
+ENGINE_CONFIG_NAME = "retention_engine_config.json"
+SIZE_REPORT_NAME = "size_report.json"
+# Per-layer config lists that must stay aligned with `num_hidden_layers`.
+_PER_LAYER_CONFIG_ATTRS = ("layer_types", "mlp_layer_types")
 
 
-class RetentionEngineConfig(PretrainedTitansConfig):
-    """Extended configuration with size management"""
-    
-    def __init__(
-        self,
-        max_total_params: float = 8e9,  # 8B
-        base_model_name: str = None,
-        base_model_params: float = None,
-        layers_to_remove: int = 0,
-        original_num_layers: int = None,
-        module_params: float = None,
-        **kwargs
-    ):
-        super().__init__(**kwargs)
-        self.max_total_params = max_total_params
-        self.base_model_name = base_model_name
-        self.base_model_params = base_model_params
-        self.layers_to_remove = layers_to_remove
-        self.original_num_layers = original_num_layers
-        self.module_params = module_params
+@dataclass
+class RetentionEngineConfig:
+    """Trimming request plus a record of what was applied.
+
+    Request fields:
+        layers_to_remove: Number of decoder layers to remove explicitly (0 = none).
+        removal_start: Index of the first layer of the removed contiguous block.
+            ``None`` removes the deepest block that still keeps the final layer,
+            i.e. layers ``[L-1-n, L-1)`` for a model with ``L`` layers.
+        max_total_params: Parameter budget used when ``auto_resize=True``.
+        module_params: Parameters reserved for a future memory module; counted
+            against ``max_total_params`` by ``auto_resize``.
+        min_layers: Minimum number of layers ``auto_resize`` keeps.
+        base_model_name: Name/path of the base model (filled in if ``None``).
+
+    Record fields (filled in by `RetentionEngine`, do not set by hand):
+        original_num_layers, base_model_params, removed_layer_indices.
+    """
+
+    layers_to_remove: int = 0
+    removal_start: Optional[int] = None
+    max_total_params: int = DEFAULT_MAX_TOTAL_PARAMS
+    module_params: int = 0
+    min_layers: int = 4
+    base_model_name: Optional[str] = None
+    original_num_layers: Optional[int] = None
+    base_model_params: Optional[int] = None
+    removed_layer_indices: List[int] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    def to_json_file(self, json_file_path: str) -> None:
+        with open(json_file_path, "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, indent=2)
+
+    @classmethod
+    def from_json_file(cls, json_file_path: str) -> "RetentionEngineConfig":
+        with open(json_file_path, encoding="utf-8") as f:
+            data = json.load(f)
+        known = {f.name for f in fields(cls)}
+        unknown = sorted(set(data) - known)
+        if unknown:
+            logger.warning("Ignoring unknown RetentionEngineConfig keys: %s", unknown)
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+
+def get_decoder_layers(model: nn.Module) -> nn.ModuleList:
+    """Return the decoder layer list of a Llama/Qwen-style causal LM (``model.model.layers``)."""
+    inner = getattr(model, "model", None)
+    layers = getattr(inner, "layers", None)
+    if not isinstance(layers, nn.ModuleList):
+        raise ValueError(
+            f"Unsupported model structure for {type(model).__name__}: expected decoder "
+            "layers at `model.model.layers` (Llama/Qwen-style causal LM)."
+        )
+    return layers
+
+
+def layer_block_indices(
+    num_total: int, num_remove: int, start: Optional[int] = None
+) -> List[int]:
+    """Indices of a contiguous block of ``num_remove`` layers.
+
+    With ``start=None`` the block ends just before the final layer, which is the
+    least destructive position for depth pruning (deep layers are the most
+    redundant, while the first and last layers matter most).
+    """
+    if num_remove < 0:
+        raise ValueError(f"num_remove must be >= 0, got {num_remove}")
+    if num_remove == 0:
+        return []
+    if num_remove >= num_total:
+        raise ValueError(
+            f"Cannot remove {num_remove} of {num_total} layers; at least one must remain."
+        )
+    if start is None:
+        start = num_total - 1 - num_remove
+    if start < 0 or start + num_remove > num_total:
+        raise ValueError(
+            f"Removal block [{start}, {start + num_remove}) is out of range for {num_total} layers."
+        )
+    return list(range(start, start + num_remove))
+
+
+def remove_layers(model: PreTrainedModel, layer_indices: List[int]) -> PreTrainedModel:
+    """Remove decoder layers in place and keep the model internally consistent.
+
+    Updates ``config.num_hidden_layers``, trims per-layer config lists
+    (``layer_types``/``mlp_layer_types``), and renumbers every ``layer_idx``
+    attribute (e.g. ``self_attn.layer_idx``) so KV-cache slots stay contiguous.
+    """
+    layers = get_decoder_layers(model)
+    num_total = len(layers)
+    to_remove = sorted(set(layer_indices))
+    if not to_remove:
+        return model
+    if to_remove[0] < 0 or to_remove[-1] >= num_total:
+        raise ValueError(
+            f"Layer indices {to_remove} out of range for {num_total} layers."
+        )
+    if len(to_remove) >= num_total:
+        raise ValueError("Cannot remove every decoder layer.")
+
+    config = model.config
+    if getattr(config, "is_heterogeneous", False):
+        raise NotImplementedError(
+            "Layer trimming does not support heterogeneous per-layer configs."
+        )
+
+    removed = set(to_remove)
+    kept = [i for i in range(num_total) if i not in removed]
+    new_layers = nn.ModuleList([layers[i] for i in kept])
+    for new_idx, layer in enumerate(new_layers):
+        for module in layer.modules():
+            if isinstance(getattr(module, "layer_idx", None), int):
+                module.layer_idx = new_idx
+    model.model.layers = new_layers
+
+    # Keep per-layer config lists aligned with the kept layers.
+    for attr in _PER_LAYER_CONFIG_ATTRS:
+        values = getattr(config, attr, None)
+        if isinstance(values, (list, tuple)) and len(values) == num_total:
+            setattr(config, attr, [values[i] for i in kept])
+    # Qwen2/Qwen3: layers with index >= max_window_layers use sliding window
+    # (older transformers derive this from the index instead of `layer_types`).
+    max_window_layers = getattr(config, "max_window_layers", None)
+    if isinstance(max_window_layers, int):
+        config.max_window_layers = sum(1 for i in kept if i < max_window_layers)
+    config.num_hidden_layers = len(new_layers)
+
+    logger.info(
+        "Removed layers %s: %d -> %d layers", to_remove, num_total, len(new_layers)
+    )
+    return model
 
 
 class ModelSizeManager:
     """Utility class for model size calculation and management"""
-    
+
     @staticmethod
     def count_parameters(model: nn.Module, exclude_embeddings: bool = False) -> int:
-        """Count total parameters in a model"""
+        """Count unique parameters (tied weights are counted once)."""
         total = 0
         for name, param in model.named_parameters():
-            if exclude_embeddings and ('embed' in name.lower() or 'lm_head' in name.lower()):
+            if exclude_embeddings and (
+                "embed" in name.lower() or "lm_head" in name.lower()
+            ):
                 continue
             total += param.numel()
         return total
-    
+
     @staticmethod
-    def estimate_layer_params(model: PreTrainedModel) -> int:
-        """Estimate parameters per transformer layer"""
-        config = model.config
-        
-        # Get model architecture details
-        hidden_size = getattr(config, 'hidden_size', 4096)
-        intermediate_size = getattr(config, 'intermediate_size', hidden_size * 4)
-        num_attention_heads = getattr(config, 'num_attention_heads', 32)
-        num_key_value_heads = getattr(config, 'num_key_value_heads', num_attention_heads)
-        
-        # Estimate parameters per layer
-        # Self-attention: Q, K, V, O projections
-        attn_params = (
-            hidden_size * hidden_size +  # Q
-            hidden_size * (hidden_size * num_key_value_heads // num_attention_heads) * 2 +  # K, V
-            hidden_size * hidden_size  # O
-        )
-        
-        # MLP: gate, up, down projections
-        mlp_params = (
-            hidden_size * intermediate_size * 2 +  # gate, up
-            intermediate_size * hidden_size  # down
-        )
-        
-        # Layer norms
-        norm_params = hidden_size * 2 * 2  # 2 layer norms, weight + bias
-        
-        return attn_params + mlp_params + norm_params
-    
+    def params_per_layer(model: PreTrainedModel) -> int:
+        """Actual parameter count of one decoder layer."""
+        layers = get_decoder_layers(model)
+        return sum(p.numel() for p in layers[0].parameters())
+
     @staticmethod
     def calculate_layers_to_remove(
         base_model: PreTrainedModel,
         module_params: int,
-        max_total_params: float = 8e9
+        max_total_params: float = DEFAULT_MAX_TOTAL_PARAMS,
+        min_layers: int = 4,
     ) -> int:
-        """Calculate how many layers to remove to stay under size limit"""
-        
-        total_base_params = ModelSizeManager.count_parameters(base_model)
-        
-        if total_base_params + module_params <= max_total_params:
+        """Number of layers to remove so that base + module params fit the budget."""
+        total = ModelSizeManager.count_parameters(base_model) + module_params
+        if total <= max_total_params:
             return 0
-        
-        # Need to remove layers
-        excess_params = (total_base_params + module_params) - max_total_params
-        params_per_layer = ModelSizeManager.estimate_layer_params(base_model)
-        
-        layers_to_remove = math.ceil(excess_params / params_per_layer)
-        
-        # Ensure we don't remove too many layers
-        num_layers = getattr(base_model.config, 'num_hidden_layers', 32)
-        max_removable = max(0, num_layers - 4)  # Keep at least 4 layers
-        
-        return min(layers_to_remove, max_removable)
+        excess = total - max_total_params
+        needed = math.ceil(excess / ModelSizeManager.params_per_layer(base_model))
+        max_removable = max(0, len(get_decoder_layers(base_model)) - min_layers)
+        if needed > max_removable:
+            logger.warning(
+                "Need %d layers removed to fit %.2fB params but only %d can go (min_layers=%d).",
+                needed,
+                max_total_params / 1e9,
+                max_removable,
+                min_layers,
+            )
+        return min(needed, max_removable)
 
 
 class RetentionEngine(nn.Module):
+    """A trimmed Hugging Face causal LM.
+
+    Args:
+        basemodel: Llama/Qwen-style ``*ForCausalLM`` model. It is trimmed in place.
+        config: Trimming request; defaults to no trimming.
+        auto_resize: Derive the number of removed layers from
+            ``max_total_params``/``module_params`` instead of ``layers_to_remove``.
+            Off by default so layers are never pruned silently; trimming must be
+            requested explicitly.
+    """
+
     def __init__(
-        self, 
-        basemodel: PreTrainedModel, 
-        config: RetentionEngineConfig,
-        auto_resize: bool = True
+        self,
+        basemodel: PreTrainedModel,
+        config: Optional[RetentionEngineConfig] = None,
+        auto_resize: bool = False,
     ):
         super().__init__()
-        
-        self.original_basemodel = basemodel
-        self.auto_resize = auto_resize
-        
-        self.module = PreTrainedTitansModel(config)
-        
-        module_params = ModelSizeManager.count_parameters(self.module)
-        config.module_params = module_params
-        
-        if auto_resize:
-            basemodel = self._resize_basemodel(basemodel, config, module_params)
-        
-        self.module.model = basemodel
-        self._attach_embeddings()
-        
-        # Combine the configurations
-        self.config = config
-        if hasattr(basemodel.config, 'to_dict'):
-            config_dict = basemodel.config.to_dict()
-            for key, value in config_dict.items():
-                self.config.__dict__[key] = value
-        elif hasattr(basemodel.config, '__dict__'):
-            for key, value in basemodel.config.__dict__.items():
-                if not key.startswith('_'):  # exclude private attributes
-                    self.config.__dict__[key] = value
-        
-    def _resize_basemodel(
-        self, 
-        basemodel: PreTrainedModel, 
-        config: RetentionEngineConfig,
-        module_params: int
-    ) -> PreTrainedModel:
-        """Resize base model by removing layers if necessary"""
-        
-        # Calculate base model size
-        base_params = ModelSizeManager.count_parameters(basemodel)
-        config.base_model_params = base_params
-        config.original_num_layers = getattr(basemodel.config, 'num_hidden_layers', None)
-        
-        # Check if resizing is needed
-        total_params = base_params + module_params
-        
-        print(f"Base model params: {base_params/1e9:.2f}B")
-        print(f"Module params: {module_params/1e9:.2f}B")
-        print(f"Total params: {total_params/1e9:.2f}B")
-        
-        if total_params <= config.max_total_params:
-            print(f"Model size is within limit ({config.max_total_params/1e9:.1f}B). No resizing needed.")
-            config.layers_to_remove = 0
-            return basemodel
-        
-        # Calculate layers to remove
-        layers_to_remove = ModelSizeManager.calculate_layers_to_remove(
-            basemodel, 
-            module_params,
-            config.max_total_params
+        config = (
+            copy.deepcopy(config) if config is not None else RetentionEngineConfig()
         )
-        
-        if layers_to_remove == 0:
-            print("Cannot reduce model size further while maintaining minimum layers.")
-            return basemodel
-        
-        print(f"Removing {layers_to_remove} layers to meet size constraint...")
-        config.layers_to_remove = layers_to_remove
-        
-        # Remove layers from model
-        resized_model = self._remove_layers(basemodel, layers_to_remove)
-        
-        # Recalculate size
-        new_base_params = ModelSizeManager.count_parameters(resized_model)
-        new_total = new_base_params + module_params
-        print(f"Resized base model: {new_base_params/1e9:.2f}B")
-        print(f"New total size: {new_total/1e9:.2f}B")
-        
-        return resized_model
-    
-    def _remove_layers(self, model: PreTrainedModel, num_layers: int) -> PreTrainedModel:
-        """Remove specified number of layers from the front of the model"""
-        
-        # Access the transformer layers
-        if hasattr(model, 'model') and hasattr(model.model, 'layers'):
-            layers = model.model.layers
+        if config.base_model_name is None:
+            config.base_model_name = (
+                getattr(basemodel.config, "_name_or_path", None) or None
+            )
+
+        if config.removed_layer_indices:
+            self._check_already_trimmed(basemodel, config)
         else:
-            print("Warning: Could not identify layer structure. Returning original model.")
-            return model
-        
-        total_layers = len(layers)
-        if num_layers >= total_layers - 4:
-            print(f"Warning: Cannot remove {num_layers} layers. Keeping minimum 4 layers.")
-            num_layers = max(0, total_layers - 4)
-            if num_layers == 0:
-                return model
-        
-        new_layers = nn.ModuleList(layers[num_layers:])
-        
-        # Replace layers in model
-        if hasattr(model, 'model') and hasattr(model.model, 'layers'):
-            model.model.layers = new_layers
-        
-        # Update config
-        if hasattr(model.config, 'num_hidden_layers'):
-            model.config.num_hidden_layers = len(new_layers)
-        elif hasattr(model.config, 'n_layer'):
-            model.config.n_layer = len(new_layers)
-        
-        print(f"Layers reduced from {total_layers} to {len(new_layers)}")
-        
-        return model
-    
-    def _merge_configs(self, base_config):
-        """Merge base model configuration with module configuration"""
-        if hasattr(base_config, 'to_dict'):
-            config_dict = base_config.to_dict()
-            for key, value in config_dict.items():
-                if key not in ['num_hidden_layers', 'n_layer']:  # Don't override layer count
-                    self.config.__dict__[key] = value
-        elif hasattr(base_config, '__dict__'):
-            for key, value in base_config.__dict__.items():
-                if not key.startswith('_') and key not in ['num_hidden_layers', 'n_layer']:
-                    self.config.__dict__[key] = value
-    
-    def _attach_embeddings(self):
-        """Attach the input embeddings from the base model to the adapter model"""
-        if self.module.model is not None and hasattr(self.module.model, 'get_input_embeddings'):
-            input_embeddings = self.module.model.get_input_embeddings()
-            self.module.set_input_embeddings(input_embeddings)
-    
+            self._trim(basemodel, config, auto_resize)
+
+        self.model = basemodel
+        self.config = config
+        self.auto_resize = auto_resize
+
+    @staticmethod
+    def _check_already_trimmed(
+        basemodel: PreTrainedModel, config: RetentionEngineConfig
+    ) -> None:
+        """Validate a model that was trimmed before (e.g. loaded via `from_pretrained`)."""
+        current = getattr(basemodel.config, "num_hidden_layers", None)
+        if config.original_num_layers is None:
+            raise ValueError(
+                "`removed_layer_indices` is a record filled in by RetentionEngine. To trim a "
+                "model, set `layers_to_remove`/`removal_start` or call `remove_layers()`."
+            )
+        expected = config.original_num_layers - len(config.removed_layer_indices)
+        if current != expected:
+            raise ValueError(
+                f"Config records a trimmed model with {expected} layers, but the given model "
+                f"has {current}. Pass the trimmed model or a fresh RetentionEngineConfig."
+            )
+
+    def _trim(
+        self,
+        basemodel: PreTrainedModel,
+        config: RetentionEngineConfig,
+        auto_resize: bool,
+    ) -> None:
+        config.original_num_layers = getattr(
+            basemodel.config, "num_hidden_layers", None
+        )
+        config.base_model_params = ModelSizeManager.count_parameters(basemodel)
+
+        num_remove = config.layers_to_remove
+        if auto_resize:
+            if num_remove:
+                raise ValueError(
+                    "Set either `layers_to_remove` or `auto_resize=True`, not both."
+                )
+            num_remove = self._layers_for_budget(basemodel, config)
+        if num_remove == 0:
+            return
+
+        num_total = len(get_decoder_layers(basemodel))
+        indices = layer_block_indices(num_total, num_remove, config.removal_start)
+        remove_layers(basemodel, indices)
+        config.layers_to_remove = num_remove
+        config.removed_layer_indices = indices
+
+    @staticmethod
+    def _layers_for_budget(
+        basemodel: PreTrainedModel, config: RetentionEngineConfig
+    ) -> int:
+        max_total = getattr(config, "max_total_params", DEFAULT_MAX_TOTAL_PARAMS)
+        module_params = getattr(config, "module_params", 0) or 0
+        total = config.base_model_params + module_params
+        logger.info(
+            "Base %.2fB + module %.2fB = %.2fB params (budget %.2fB)",
+            config.base_model_params / 1e9,
+            module_params / 1e9,
+            total / 1e9,
+            max_total / 1e9,
+        )
+        return ModelSizeManager.calculate_layers_to_remove(
+            basemodel, module_params, max_total, getattr(config, "min_layers", 4)
+        )
+
+    def attach_memory_module(self, *args, **kwargs):
+        """Attach a Titans memory module (thelethe). Planned for a follow-up PR."""
+        raise NotImplementedError(
+            "Titans memory-module integration is not available yet: thelethe's "
+            "PreTrainedTitansModel/CronosForCausalLM are still empty upstream. This release "
+            "covers layer trimming + restoration distillation only."
+        )
+
     def forward(self, *args, **kwargs):
-        return self.module(*args, **kwargs)
-    
+        return self.model(*args, **kwargs)
+
+    def generate(self, *args, **kwargs):
+        return self.model.generate(*args, **kwargs)
+
     def get_model_size_info(self) -> Dict[str, Any]:
-        """Get detailed size information about the model"""
-        base_params = ModelSizeManager.count_parameters(self.module.model) if self.module.model else 0
-        module_params = ModelSizeManager.count_parameters(self.module, exclude_embeddings=True)
-        total_params = base_params + module_params
-        
+        """Parameter counts of the wrapped model (each parameter counted once)."""
+        base_params = ModelSizeManager.count_parameters(self.model)
+        total_params = ModelSizeManager.count_parameters(self)
+        module_params = total_params - base_params
         return {
-            'base_model_params': base_params,
-            'base_model_size_gb': base_params / 1e9,
-            'module_params': module_params,
-            'module_size_gb': module_params / 1e9,
-            'total_params': total_params,
-            'total_size_gb': total_params / 1e9,
-            'layers_removed': self.config.layers_to_remove,
-            'original_layers': self.config.original_num_layers,
-            'current_layers': getattr(self.module.model.config, 'num_hidden_layers', None) if self.module.model else None
+            "base_model_params": base_params,
+            "module_params": module_params,
+            "reserved_module_params": self.config.module_params,
+            "total_params": total_params,
+            "total_params_billion": total_params / 1e9,
+            "original_base_model_params": self.config.base_model_params,
+            "layers_removed": len(self.config.removed_layer_indices),
+            "removed_layer_indices": list(self.config.removed_layer_indices),
+            "original_layers": self.config.original_num_layers,
+            "current_layers": getattr(self.model.config, "num_hidden_layers", None),
         }
-    
+
+    def save_pretrained(self, save_directory: str, **kwargs) -> None:
+        """Save the trimmed model in standard HF format plus the engine config.
+
+        ``save_directory`` can be loaded with either ``RetentionEngine.from_pretrained``
+        or plain ``AutoModelForCausalLM.from_pretrained``.
+        """
+        os.makedirs(save_directory, exist_ok=True)
+        self.model.save_pretrained(save_directory, **kwargs)
+        self.config.to_json_file(os.path.join(save_directory, ENGINE_CONFIG_NAME))
+        with open(
+            os.path.join(save_directory, SIZE_REPORT_NAME), "w", encoding="utf-8"
+        ) as f:
+            json.dump(self.get_model_size_info(), f, indent=2)
+
     @classmethod
     def from_pretrained(
-        cls,
-        model_id: str,
-        basemodel: PreTrainedModel,
-        auto_resize: bool = True,
-        max_total_params: float = 8e9
+        cls, pretrained_model_name_or_path: str, **model_kwargs
     ) -> "RetentionEngine":
-        """Load a RetentionEngine from a pretrained model and configuration"""
-        
-        # Load config with size constraints
-        config = RetentionEngineConfig.from_pretrained(model_id)
-        config.max_total_params = max_total_params
-        config.base_model_name = getattr(basemodel.config, '_name_or_path', 'unknown')
-        
-        # Create engine with auto-resizing
-        engine = cls(basemodel, config, auto_resize=auto_resize)
-        
-        # Load pretrained module weights
-        module = PreTrainedTitansModel.from_pretrained(model_id)
-        engine.module.model = engine.module.model  # Use the resized model
-        engine.module = module
-                
-        return engine
-    
-    def save_pretrained(self, save_directory: str):
-        """Save the RetentionEngine to a directory"""
-        # Save size information in config
-        size_info = self.get_model_size_info()
-        for key, value in size_info.items():
-            setattr(self.config, f'size_{key}', value)
-        
-        self.module.save_pretrained(save_directory)
-        self.config.save_pretrained(save_directory)
-        
-        # Save size report
-        import json
-        with open(f"{save_directory}/size_report.json", 'w') as f:
-            json.dump(size_info, f, indent=2)
+        """Load a model saved by `save_pretrained` (layers are not trimmed again).
 
-
-# Example usage
-if __name__ == "__main__":
-    from transformers import AutoModelForCausalLM
-    
-    # Load a base model (e.g., 13B model)
-    base_model = AutoModelForCausalLM.from_pretrained(
-        "meta-llama/Llama-2-13b-hf",
-        torch_dtype=torch.bfloat16,
-        device_map="auto"
-    )
-    
-    # Create config with 8B size limit
-    config = RetentionEngineConfig(
-        max_total_params=8e9,  # 8B max
-        base_model_name="meta-llama/Llama-2-13b-hf",
-        # Add other Titans config parameters here
-    )
-    
-    # Create engine with automatic resizing
-    engine = RetentionEngine(
-        basemodel=base_model,
-        config=config,
-        auto_resize=True  # Automatically remove layers if needed
-    )
-    
-    # Check final size
-    size_info = engine.get_model_size_info()
-    print("\nFinal Model Size Information:")
-    for key, value in size_info.items():
-        print(f"  {key}: {value}")
-    
-    # Save the resized model
-    engine.save_pretrained("./retention_engine_8b")
+        ``model_kwargs`` go to ``AutoModelForCausalLM.from_pretrained`` (e.g. ``dtype``).
+        The engine config is read from a local directory; without it the model is
+        wrapped as-is.
+        """
+        model = AutoModelForCausalLM.from_pretrained(
+            pretrained_model_name_or_path, **model_kwargs
+        )
+        config_path = os.path.join(pretrained_model_name_or_path, ENGINE_CONFIG_NAME)
+        config = (
+            RetentionEngineConfig.from_json_file(config_path)
+            if os.path.isfile(config_path)
+            else None
+        )
+        return cls(model, config)
