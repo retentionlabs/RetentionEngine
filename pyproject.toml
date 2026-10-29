@@ -64,6 +64,12 @@ dev = [
     "datasets",
 ]
 
+[tool.uv]
+# thelethe (`titans` extra) requires a transformers git fork. Without this override the
+# uv lock would put every environment on that fork; keep the trimming/KD path on PyPI
+# transformers. pip ignores this table.
+override-dependencies = ["transformers>=4.51"]
+
 [project.urls]
 "Homepage" = "https://github.com/retentionlabs/retentionengine"
 "Bug Tracker" = "https://github.com/retentionlabs/retentionengine/issues"
