@@ -174,7 +174,10 @@ class DistillationTrainer(Trainer):
         if use_fp8_teacher:
             # Refuses device-mapped teachers before converting anything.
             teacher_model = convert_to_fp8_layers(teacher_model)
-        if getattr(teacher_model, "hf_device_map", None) is None:
+        # Keep a teacher the caller already placed on an accelerator (e.g. a second GPU).
+        if getattr(teacher_model, "hf_device_map", None) is None and (
+            next(teacher_model.parameters()).device.type == "cpu"
+        ):
             teacher_model.to(self.args.device)
         teacher_model.eval()
         for param in teacher_model.parameters():
@@ -183,6 +186,9 @@ class DistillationTrainer(Trainer):
 
     def _teacher_logits(self, inputs) -> torch.Tensor:
         teacher_inputs = {k: v for k, v in inputs.items() if k != "labels"}
+        if getattr(self.teacher_model, "hf_device_map", None) is None:
+            t_dev = next(self.teacher_model.parameters()).device
+            teacher_inputs = {k: v.to(t_dev) for k, v in teacher_inputs.items()}
         with torch.no_grad():
             if self.use_fp8_teacher:
                 te = _import_transformer_engine()
