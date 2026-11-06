@@ -175,3 +175,9 @@ cython_debug/
 
 # Pretraining
 pretrained/
+
+# Dependency lock (library: not committed)
+uv.lock
+
+# Generated datasets
+data/
