@@ -1,7 +1,48 @@
 # RetentionEngine
-A simple adapter implementation to transform pretrained Transformer-family models into the Titans architecture.
+Trim layers of pretrained Transformer models (Llama / Qwen families) and restore their quality with knowledge distillation.
 
-## Experiments Setup
+## Scope
+- **Layer trimming** (`RetentionEngine`): removes a contiguous block of decoder layers — by default the deep block just before the final layer (`removal_start` picks another position). The trimmed model stays a standard Hugging Face model (`save_pretrained` / `AutoModelForCausalLM.from_pretrained`). Pruning by parameter budget is opt-in (`auto_resize=True`).
+- **Restoration KD** (`retentionengine.utils.DistillationTrainer`): `loss = (1 - α)·LM + α·T²·KL(teacher ‖ student)` over non-padding tokens. The teacher runs in bf16 by default; FP8 (Transformer Engine) is opt-in with `use_fp8_teacher=True`.
+- **Titans memory module** (thelethe): planned for a follow-up PR. `RetentionEngine.attach_memory_module()` raises `NotImplementedError`; nothing in the package imports thelethe yet. The experiment plan below depends on it.
+
+## Install
+```bash
+git clone https://github.com/retentionlabs/RetentionEngine.git
+cd RetentionEngine
+uv venv && uv pip install -e ".[train,datagen]"
+source .venv/bin/activate  # the Usage steps below run in this venv
+```
+`datagen` is needed for step 2 of Usage (`scripts/dataset_generator.py`). To run the notebooks, use a Jupyter kernel from this venv (e.g. `uv pip install ipykernel`).
+
+| Extra | Installs | Needed for |
+|---|---|---|
+| `train` | datasets, wandb, accelerate | restoration training / notebooks |
+| `fp8` | transformer-engine[pytorch] | FP8 teacher (`use_fp8_teacher=True`, CUDA GPU) |
+| `datagen` | json-repair, accelerate | `scripts/dataset_generator.py` |
+| `titans` | thelethe (pinned git commit) | future Titans integration (not used yet) |
+
+## Usage
+```python
+import torch
+from transformers import AutoModelForCausalLM
+from retentionengine import RetentionEngine, RetentionEngineConfig
+
+base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-8B", torch_dtype=torch.bfloat16)
+engine = RetentionEngine(base, RetentionEngineConfig(layers_to_remove=4))  # drops layers 31-34 of 36
+engine.save_pretrained("pretrained/Qwen3-8B-trimmed")
+```
+1. `usage.ipynb` — trim and save the student.
+2. `python scripts/dataset_generator.py --model-name Qwen/Qwen3-8B --output data/qwen3_memory_aligned_dataset.jsonl` — generate restoration data.
+3. `restoration_training.ipynb` — distill the full model into the trimmed one and compare their generations.
+
+## Tests
+CPU-only smoke tests with tiny random Llama/Qwen3 models:
+```bash
+uv run pytest
+```
+
+## Experiments Setup (planned, needs the Titans integration)
 ### Exp 1: Comparison with Base Models [3B]
 #### Baseline
 - Titans 4B (Gemma3 4B IT)
@@ -50,17 +91,8 @@ A simple adapter implementation to transform pretrained Transformer-family model
 - Cronos-G 9B (Gemma3 9B IT)
 
 
-## Build
-```bash
-git clone https://github.com/retentionlabs/RetentionEngine.git
-cd RetentionEngine
-uv pip sync
-```
-
-## Usage
-- See `usage.ipynb` for usage examples.
-
 ## Deploy
+PyPI rejects direct-URL dependencies, so drop or replace the `titans` extra before publishing.
 ```bash
 rm -rf dist/
 rm -rf build/
